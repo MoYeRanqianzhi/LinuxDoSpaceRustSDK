@@ -1,0 +1,20 @@
+[package]
+name = "linuxdospace-rust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "LinuxDoSpace Rust SDK for HTTPS mail streaming"
+repository = "https://github.com/MoYeRanqianzhi/LinuxDoSpace"
+
+[lib]
+name = "linuxdospace"
+path = "src/lib.rs"
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+mailparse = "0.15"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
