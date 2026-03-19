@@ -4,7 +4,7 @@ Rust SDK for LinuxDoSpace token mail streaming over HTTPS.
 
 The SDK follows the shared contract in:
 
-- `sdk/spec/MAIL_STREAM_PROTOCOL.md`
+- `https://github.com/MoYeRanqianzhi/LinuxDoSpace/blob/main/sdk/spec/MAIL_STREAM_PROTOCOL.md`
 
 Core runtime behavior:
 
@@ -18,7 +18,6 @@ Core runtime behavior:
 ## Install (local workspace)
 
 ```bash
-cd sdk/rust
 cargo check
 ```
 
@@ -60,7 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Validation commands
 
 ```bash
-cd sdk/rust
 cargo fmt -- --check
 cargo check
 cargo test

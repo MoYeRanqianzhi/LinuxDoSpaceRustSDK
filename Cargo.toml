@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "LinuxDoSpace Rust SDK for HTTPS mail streaming"
-repository = "https://github.com/MoYeRanqianzhi/LinuxDoSpace"
+repository = "https://github.com/MoYeRanqianzhi/LinuxDoSpaceRustSDK"
 
 [lib]
 name = "linuxdospace"
