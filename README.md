@@ -18,6 +18,11 @@ Core runtime behavior:
 - stream open timeout and post-connect idle timeout are handled separately
 - `client.close()` actively cancels the live stream instead of waiting for the socket to wake up
 - protocol-decode failures after connect are treated as fatal, not endlessly retried
+
+Important:
+
+- `Suffix::linuxdo_space()` is semantic, not literal
+- the SDK resolves it to `<owner_username>.linuxdo.space` after `ready.owner_username`
 - listener queues are bounded; dropped full-stream messages can be inspected through `client.dropped()`
 
 ## Install (local workspace)

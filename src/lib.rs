@@ -47,6 +47,10 @@ impl Suffix {
         Self::LinuxdoSpace
     }
 
+    fn is_linuxdo_space(&self) -> bool {
+        matches!(self, Self::LinuxdoSpace)
+    }
+
     fn normalized(&self) -> Result<String, LinuxDoSpaceError> {
         let raw = match self {
             Self::LinuxdoSpace => "linuxdo.space",
@@ -234,6 +238,7 @@ struct ClientInner {
     full_listeners: Mutex<HashMap<usize, SyncSender<ListenerItem>>>,
     full_dropped: AtomicU64,
     bindings_by_suffix: Mutex<HashMap<String, Vec<BindingEntry>>>,
+    owner_username: Mutex<Option<String>>,
     next_id: AtomicUsize,
 }
 
@@ -271,6 +276,7 @@ impl Client {
             full_listeners: Mutex::new(HashMap::new()),
             full_dropped: AtomicU64::new(0),
             bindings_by_suffix: Mutex::new(HashMap::new()),
+            owner_username: Mutex::new(None),
             next_id: AtomicUsize::new(1),
         });
 
@@ -365,7 +371,7 @@ impl Client {
         let normalized_prefix = normalize_prefix(prefix.as_ref())?;
         self.bind_internal(
             BindingMode::Exact,
-            suffix.normalized()?,
+            self.resolve_binding_suffix(&suffix)?,
             allow_overlap,
             Some(normalized_prefix),
             None,
@@ -388,7 +394,7 @@ impl Client {
         })?;
         self.bind_internal(
             BindingMode::Pattern,
-            suffix.normalized()?,
+            self.resolve_binding_suffix(&suffix)?,
             allow_overlap,
             None,
             Some(regex),
@@ -440,6 +446,30 @@ impl Client {
         Ok(Mailbox {
             inner: mailbox_inner,
         })
+    }
+
+    fn resolve_binding_suffix(&self, suffix: &Suffix) -> Result<String, LinuxDoSpaceError> {
+        let normalized_suffix = suffix.normalized()?;
+        if !suffix.is_linuxdo_space() {
+            return Ok(normalized_suffix);
+        }
+
+        let owner_username = self
+            .inner
+            .owner_username
+            .lock()
+            .expect("owner_username lock poisoned")
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if owner_username.is_empty() {
+            return Err(LinuxDoSpaceError::stream(
+                "stream bootstrap did not provide owner_username required to resolve Suffix::linuxdo_space()",
+            ));
+        }
+
+        Ok(format!("{owner_username}.{normalized_suffix}"))
     }
 
     /// Returns mailbox bindings matched by one message address using current local binding state.
@@ -853,8 +883,8 @@ async fn consume_stream_once(
                     Ok(Some(chunk)) => {
                         buffered.extend_from_slice(&chunk);
                         while let Some(line) = take_next_line(&mut buffered) {
-                            let saw_event = handle_stream_line(client, &line)?;
-                            if saw_event && !*ready_sent {
+                            let ready_received = handle_stream_line(client, &line)?;
+                            if ready_received && !*ready_sent {
                                 if let Some(tx) = ready_tx.take() {
                                     let _ = tx.send(Ok(()));
                                 }
@@ -864,8 +894,8 @@ async fn consume_stream_once(
                     }
                     Ok(None) => {
                         if let Some(line) = take_final_line(&mut buffered) {
-                            let saw_event = handle_stream_line(client, &line)?;
-                            if saw_event && !*ready_sent {
+                            let ready_received = handle_stream_line(client, &line)?;
+                            if ready_received && !*ready_sent {
                                 if let Some(tx) = ready_tx.take() {
                                     let _ = tx.send(Ok(()));
                                 }
@@ -874,7 +904,7 @@ async fn consume_stream_once(
                         }
                         if !*ready_sent {
                             return Err(StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
-                                "initial mail stream ended before first event",
+                                "initial mail stream ended before ready event",
                             )));
                         }
                         return Err(StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
@@ -950,14 +980,33 @@ fn handle_stream_line(
         )))
     })?;
     match event.event_type.as_str() {
-        "ready" | "heartbeat" => Ok(true),
+        "ready" => {
+            let owner_username = event
+                .payload
+                .get("owner_username")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if owner_username.is_empty() {
+                return Err(StreamLoopError::Fatal(LinuxDoSpaceError::stream(
+                    "ready event did not include owner_username",
+                )));
+            }
+            *client
+                .owner_username
+                .lock()
+                .expect("owner_username lock poisoned") = Some(owner_username);
+            Ok(true)
+        }
+        "heartbeat" => Ok(false),
         "mail" => {
             let envelope = parse_mail_event(&event)
                 .map_err(StreamLoopError::Fatal)?;
             dispatch_envelope(client, envelope);
-            Ok(true)
+            Ok(false)
         }
-        _ => Ok(true),
+        _ => Ok(false),
     }
 }
 
@@ -1367,6 +1416,9 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
 
+    const TEST_OWNER_USERNAME: &str = "testuser";
+    const TEST_NAMESPACE_SUFFIX: &str = "testuser.linuxdo.space";
+
     #[test]
     fn suffix_parses() {
         assert_eq!(
@@ -1542,7 +1594,7 @@ mod tests {
                 write_chunk(stream, ready_line().as_bytes());
                 for index in 0..count {
                     let event = mail_line(
-                        &format!("alice@linuxdo.space"),
+                        &format!("alice@{TEST_NAMESPACE_SUFFIX}"),
                         &format!("Subject {index}"),
                     );
                     write_chunk(stream, event.as_bytes());
@@ -1596,7 +1648,8 @@ mod tests {
     fn ready_line() -> String {
         serde_json::json!({
             "type": "ready",
-            "token_public_id": "tok_123"
+            "token_public_id": "tok_123",
+            "owner_username": TEST_OWNER_USERNAME
         })
         .to_string()
             + "\n"
