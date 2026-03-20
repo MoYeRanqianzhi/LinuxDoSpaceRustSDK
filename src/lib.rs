@@ -7,27 +7,30 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::io::{BufRead, BufReader};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
-use reqwest::blocking::{Client as HttpClient, Response};
+use reqwest::{Client as HttpClient, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, USER_AGENT};
 use serde::Deserialize;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.linuxdo.space";
 const STREAM_PATH: &str = "/v1/token/email/stream";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_millis(300);
+const LISTENER_BUFFER_SIZE: usize = 128;
 
 /// One mail suffix value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -181,8 +184,12 @@ impl std::error::Error for LinuxDoSpaceError {}
 #[derive(Debug, Clone)]
 enum ListenerItem {
     Message(MailMessage),
-    Failure(LinuxDoSpaceError),
-    Closed,
+}
+
+#[derive(Debug)]
+enum StreamLoopError {
+    Fatal(LinuxDoSpaceError),
+    Recoverable(LinuxDoSpaceError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,8 +228,11 @@ struct ClientInner {
     http: HttpClient,
     closed: AtomicBool,
     connected: AtomicBool,
+    shutdown: CancellationToken,
+    runner: Mutex<Option<JoinHandle<()>>>,
     fatal_error: Mutex<Option<LinuxDoSpaceError>>,
-    full_listeners: Mutex<HashMap<usize, Sender<ListenerItem>>>,
+    full_listeners: Mutex<HashMap<usize, SyncSender<ListenerItem>>>,
+    full_dropped: AtomicU64,
     bindings_by_suffix: Mutex<HashMap<String, Vec<BindingEntry>>>,
     next_id: AtomicUsize,
 }
@@ -244,7 +254,6 @@ impl Client {
         let normalized_base_url = normalize_base_url(base_url.unwrap_or(DEFAULT_BASE_URL))?;
         let http = HttpClient::builder()
             .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-            .timeout(DEFAULT_READ_TIMEOUT)
             .build()
             .map_err(|err| {
                 LinuxDoSpaceError::stream(format!("failed to build http client: {err}"))
@@ -256,24 +265,47 @@ impl Client {
             http,
             closed: AtomicBool::new(false),
             connected: AtomicBool::new(false),
+            shutdown: CancellationToken::new(),
+            runner: Mutex::new(None),
             fatal_error: Mutex::new(None),
             full_listeners: Mutex::new(HashMap::new()),
+            full_dropped: AtomicU64::new(0),
             bindings_by_suffix: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(1),
         });
 
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), LinuxDoSpaceError>>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), LinuxDoSpaceError>>(1);
         let thread_inner = Arc::clone(&inner);
-        thread::spawn(move || run_stream_loop(thread_inner, Some(ready_tx)));
+        let handle = thread::spawn(move || {
+            let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(LinuxDoSpaceError::stream(format!(
+                        "failed to build tokio runtime: {err}"
+                    ))));
+                    return;
+                }
+            };
+            runtime.block_on(run_stream_loop(thread_inner, Some(ready_tx)));
+        });
+        *inner.runner.lock().expect("runner lock poisoned") = Some(handle);
+
+        let client = Self { inner };
 
         match ready_rx.recv_timeout(DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(1)) {
-            Ok(result) => {
-                result?;
-                Ok(Self { inner })
+            Ok(result) => match result {
+                Ok(()) => Ok(client),
+                Err(error) => {
+                    let _ = client.close();
+                    Err(error)
+                }
+            },
+            Err(_) => {
+                let _ = client.close();
+                Err(LinuxDoSpaceError::stream(
+                    "timed out while opening the LinuxDoSpace HTTPS mail stream",
+                ))
             }
-            Err(_) => Err(LinuxDoSpaceError::stream(
-                "timed out while opening the LinuxDoSpace HTTPS mail stream",
-            )),
         }
     }
 
@@ -289,13 +321,37 @@ impl Client {
                 .is_none()
     }
 
+    /// Returns the terminal fatal error, if the client stopped because of one.
+    pub fn error(&self) -> Option<LinuxDoSpaceError> {
+        self.inner
+            .fatal_error
+            .lock()
+            .expect("fatal_error lock poisoned")
+            .clone()
+    }
+
+    /// Returns the number of full-stream messages dropped because listeners were full.
+    pub fn dropped(&self) -> u64 {
+        self.inner.full_dropped.load(Ordering::SeqCst)
+    }
+
     /// Closes the client and all listeners.
     pub fn close(&self) -> Result<(), LinuxDoSpaceError> {
-        if self.inner.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
+        let was_closed = self.inner.closed.swap(true, Ordering::SeqCst);
         self.inner.connected.store(false, Ordering::SeqCst);
-        broadcast_control(&self.inner, ListenerItem::Closed);
+        if !was_closed {
+            self.inner.shutdown.cancel();
+            close_local_state(&self.inner);
+        }
+        if let Some(handle) = self
+            .inner
+            .runner
+            .lock()
+            .expect("runner lock poisoned")
+            .take()
+        {
+            let _ = handle.join();
+        }
         Ok(())
     }
 
@@ -360,6 +416,7 @@ impl Client {
             pattern_text: regex.as_ref().map(|item| item.as_str().to_string()),
             listener_sender: Mutex::new(None),
             closed: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
         });
 
         let entry = BindingEntry {
@@ -387,6 +444,9 @@ impl Client {
 
     /// Returns mailbox bindings matched by one message address using current local binding state.
     pub fn route(&self, message: &MailMessage) -> Vec<Mailbox> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
         let normalized = message.address.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             return Vec::new();
@@ -410,7 +470,7 @@ impl Client {
             return Err(error);
         }
         let listener_id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel::<ListenerItem>();
+        let (tx, rx) = mpsc::sync_channel::<ListenerItem>(LISTENER_BUFFER_SIZE);
         self.inner
             .full_listeners
             .lock()
@@ -426,6 +486,15 @@ impl Client {
     }
 
     fn ensure_open(&self) -> Result<(), LinuxDoSpaceError> {
+        if let Some(error) = self
+            .inner
+            .fatal_error
+            .lock()
+            .expect("fatal_error lock poisoned")
+            .clone()
+        {
+            return Err(error);
+        }
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(LinuxDoSpaceError::closed("client is already closed"));
         }
@@ -451,20 +520,22 @@ impl Iterator for ClientListener {
         }
         match recv_listener_item(&self.receiver, self.deadline) {
             Ok(ListenerItem::Message(message)) => Some(Ok(message)),
-            Ok(ListenerItem::Failure(error)) => {
-                self.finished = true;
-                Some(Err(error))
-            }
-            Ok(ListenerItem::Closed) => {
-                self.finished = true;
-                None
-            }
             Err(RecvTimeoutError::Timeout) => {
                 self.finished = true;
                 None
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.finished = true;
+                if let Some(client) = self.client.upgrade() {
+                    if let Some(error) = client
+                        .fatal_error
+                        .lock()
+                        .expect("fatal_error lock poisoned")
+                        .clone()
+                    {
+                        return Some(Err(error));
+                    }
+                }
                 None
             }
         }
@@ -492,8 +563,9 @@ struct MailboxInner {
     allow_overlap: bool,
     prefix: Option<String>,
     pattern_text: Option<String>,
-    listener_sender: Mutex<Option<Sender<ListenerItem>>>,
+    listener_sender: Mutex<Option<SyncSender<ListenerItem>>>,
     closed: AtomicBool,
+    dropped: AtomicU64,
 }
 
 /// One local mailbox binding.
@@ -537,6 +609,11 @@ impl Mailbox {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
+    /// Returns the number of messages dropped because this mailbox listener was full.
+    pub fn dropped(&self) -> u64 {
+        self.inner.dropped.load(Ordering::SeqCst)
+    }
+
     /// Starts mailbox listener. One mailbox allows one active listener at a time.
     pub fn listen(&self, timeout: Option<Duration>) -> Result<MailboxListener, LinuxDoSpaceError> {
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -553,7 +630,7 @@ impl Mailbox {
                 "mailbox already has an active listener",
             ));
         }
-        let (tx, rx) = mpsc::channel::<ListenerItem>();
+        let (tx, rx) = mpsc::sync_channel::<ListenerItem>(LISTENER_BUFFER_SIZE);
         *guard = Some(tx);
         drop(guard);
 
@@ -575,15 +652,11 @@ impl Mailbox {
             unregister_binding(&client, self.inner.id);
         }
 
-        if let Some(sender) = self
-            .inner
+        self.inner
             .listener_sender
             .lock()
             .expect("mailbox listener_sender lock poisoned")
-            .take()
-        {
-            let _ = sender.send(ListenerItem::Closed);
-        }
+            .take();
         Ok(())
     }
 }
@@ -605,20 +678,24 @@ impl Iterator for MailboxListener {
         }
         match recv_listener_item(&self.receiver, self.deadline) {
             Ok(ListenerItem::Message(message)) => Some(Ok(message)),
-            Ok(ListenerItem::Failure(error)) => {
-                self.finished = true;
-                Some(Err(error))
-            }
-            Ok(ListenerItem::Closed) => {
-                self.finished = true;
-                None
-            }
             Err(RecvTimeoutError::Timeout) => {
                 self.finished = true;
                 None
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.finished = true;
+                if let Some(mailbox) = self.mailbox.upgrade() {
+                    if let Some(client) = mailbox.client.upgrade() {
+                        if let Some(error) = client
+                            .fatal_error
+                            .lock()
+                            .expect("fatal_error lock poisoned")
+                            .clone()
+                        {
+                            return Some(Err(error));
+                        }
+                    }
+                }
                 None
             }
         }
@@ -710,121 +787,248 @@ fn recv_listener_item(
     }
 }
 
-fn run_stream_loop(
+async fn run_stream_loop(
     client: Arc<ClientInner>,
-    ready_tx: Option<Sender<Result<(), LinuxDoSpaceError>>>,
+    ready_tx: Option<SyncSender<Result<(), LinuxDoSpaceError>>>,
 ) {
     let mut ready_sent = false;
     let mut ready_tx = ready_tx;
 
     while !client.closed.load(Ordering::SeqCst) {
-        let stream_result = consume_stream_once(&client);
-        match stream_result {
+        match consume_stream_once(&client, &mut ready_sent, &mut ready_tx).await {
             Ok(()) => {
-                if !ready_sent {
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(Ok(()));
-                    }
-                    ready_sent = true;
+                if client.closed.load(Ordering::SeqCst) {
+                    return;
                 }
             }
-            Err(error) => {
+            Err(StreamLoopError::Fatal(error)) => {
                 client.connected.store(false, Ordering::SeqCst);
-
                 if !ready_sent {
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Err(error.clone()));
                     }
-                    ready_sent = true;
                 }
-
-                match &error {
-                    LinuxDoSpaceError::Authentication(_) => {
-                        *client
-                            .fatal_error
-                            .lock()
-                            .expect("fatal_error lock poisoned") = Some(error.clone());
-                        broadcast_control(&client, ListenerItem::Failure(error));
-                        return;
+                set_fatal_error(&client, error);
+                return;
+            }
+            Err(StreamLoopError::Recoverable(error)) => {
+                client.connected.store(false, Ordering::SeqCst);
+                if !ready_sent {
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(error));
                     }
-                    _ => {
-                        if client.closed.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        thread::sleep(RECONNECT_DELAY);
-                    }
+                    return;
+                }
+                tokio::select! {
+                    _ = client.shutdown.cancelled() => return,
+                    _ = sleep(RECONNECT_DELAY) => {}
                 }
             }
         }
     }
 }
 
-fn consume_stream_once(client: &ClientInner) -> Result<(), LinuxDoSpaceError> {
-    let mut response = open_stream(client)?;
+async fn consume_stream_once(
+    client: &Arc<ClientInner>,
+    ready_sent: &mut bool,
+    ready_tx: &mut Option<SyncSender<Result<(), LinuxDoSpaceError>>>,
+) -> Result<(), StreamLoopError> {
+    let mut response = open_stream(client).await?;
     client.connected.store(true, Ordering::SeqCst);
 
-    let mut reader = BufReader::new(&mut response);
-    let mut line = String::new();
+    let mut buffered = Vec::<u8>::new();
     loop {
-        if client.closed.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                return Err(LinuxDoSpaceError::stream(
-                    "stream closed by remote peer; reconnecting",
-                ));
+        tokio::select! {
+            _ = client.shutdown.cancelled() => {
+                return Ok(());
             }
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let event: StreamEvent = serde_json::from_str(trimmed).map_err(|err| {
-                    LinuxDoSpaceError::stream(format!("received invalid JSON from stream: {err}"))
+            chunk_result = timeout(DEFAULT_IDLE_TIMEOUT, response.chunk()) => {
+                let chunk_result = chunk_result.map_err(|_| {
+                    StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
+                        "mail stream stalled and will reconnect",
+                    ))
                 })?;
-                match event.event_type.as_str() {
-                    "ready" | "heartbeat" => continue,
-                    "mail" => {
-                        let envelope = parse_mail_event(&event)?;
-                        dispatch_envelope(client, envelope);
+
+                match chunk_result {
+                    Ok(Some(chunk)) => {
+                        buffered.extend_from_slice(&chunk);
+                        while let Some(line) = take_next_line(&mut buffered) {
+                            let saw_event = handle_stream_line(client, &line)?;
+                            if saw_event && !*ready_sent {
+                                if let Some(tx) = ready_tx.take() {
+                                    let _ = tx.send(Ok(()));
+                                }
+                                *ready_sent = true;
+                            }
+                        }
                     }
-                    _ => continue,
+                    Ok(None) => {
+                        if let Some(line) = take_final_line(&mut buffered) {
+                            let saw_event = handle_stream_line(client, &line)?;
+                            if saw_event && !*ready_sent {
+                                if let Some(tx) = ready_tx.take() {
+                                    let _ = tx.send(Ok(()));
+                                }
+                                *ready_sent = true;
+                            }
+                        }
+                        if !*ready_sent {
+                            return Err(StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
+                                "initial mail stream ended before first event",
+                            )));
+                        }
+                        return Err(StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
+                            "stream closed by remote peer; reconnecting",
+                        )));
+                    }
+                    Err(err) => {
+                        return Err(StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
+                            format!("failed while reading stream: {err}"),
+                        )));
+                    }
                 }
-            }
-            Err(err) => {
-                return Err(LinuxDoSpaceError::stream(format!(
-                    "failed while reading stream: {err}"
-                )));
             }
         }
     }
 }
 
-fn open_stream(client: &ClientInner) -> Result<Response, LinuxDoSpaceError> {
+async fn open_stream(client: &ClientInner) -> Result<Response, StreamLoopError> {
     let url = format!("{}{}", client.base_url, STREAM_PATH);
-    let response = client
+    let request = client
         .http
         .get(url)
         .header(AUTHORIZATION, format!("Bearer {}", client.token))
         .header(ACCEPT, "application/x-ndjson")
         .header(CACHE_CONTROL, "no-store")
-        .header(USER_AGENT, "linuxdospace-rust-sdk/0.1.0")
-        .send()
-        .map_err(|err| LinuxDoSpaceError::stream(format!("failed to open stream: {err}")))?;
+        .header(USER_AGENT, "linuxdospace-rust-sdk/0.1.0");
+
+    let response = timeout(DEFAULT_CONNECT_TIMEOUT, request.send())
+        .await
+        .map_err(|_| {
+            StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
+                "timed out while opening the LinuxDoSpace HTTPS mail stream",
+            ))
+        })?
+        .map_err(|err| {
+            StreamLoopError::Recoverable(LinuxDoSpaceError::stream(format!(
+                "failed to open stream: {err}"
+            )))
+        })?;
 
     let status = response.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
-        return Err(LinuxDoSpaceError::auth("api token was rejected by backend"));
+        return Err(StreamLoopError::Fatal(LinuxDoSpaceError::auth(
+            "api token was rejected by backend",
+        )));
     }
     if !status.is_success() {
-        return Err(LinuxDoSpaceError::stream(format!(
-            "unexpected stream status code: {}",
-            status.as_u16()
+        return Err(StreamLoopError::Recoverable(LinuxDoSpaceError::stream(
+            format!("unexpected stream status code: {}", status.as_u16()),
         )));
     }
     Ok(response)
+}
+
+fn handle_stream_line(
+    client: &ClientInner,
+    line: &[u8],
+) -> Result<bool, StreamLoopError> {
+    let trimmed = std::str::from_utf8(line)
+        .map_err(|err| {
+            StreamLoopError::Fatal(LinuxDoSpaceError::stream(format!(
+                "received invalid UTF-8 from stream: {err}"
+            )))
+        })?
+        .trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    let event: StreamEvent = serde_json::from_str(trimmed).map_err(|err| {
+        StreamLoopError::Fatal(LinuxDoSpaceError::stream(format!(
+            "received invalid JSON from stream: {err}"
+        )))
+    })?;
+    match event.event_type.as_str() {
+        "ready" | "heartbeat" => Ok(true),
+        "mail" => {
+            let envelope = parse_mail_event(&event)
+                .map_err(StreamLoopError::Fatal)?;
+            dispatch_envelope(client, envelope);
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
+fn take_next_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let newline_index = buffer.iter().position(|item| *item == b'\n')?;
+    let mut line = buffer.drain(..=newline_index).collect::<Vec<_>>();
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    Some(line)
+}
+
+fn take_final_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buffer.is_empty() {
+        return None;
+    }
+    let mut line = std::mem::take(buffer);
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    if line.is_empty() {
+        return None;
+    }
+    Some(line)
+}
+
+fn set_fatal_error(client: &ClientInner, error: LinuxDoSpaceError) {
+    {
+        let mut fatal_error = client
+            .fatal_error
+            .lock()
+            .expect("fatal_error lock poisoned");
+        if fatal_error.is_none() {
+            *fatal_error = Some(error);
+        }
+    }
+    client.closed.store(true, Ordering::SeqCst);
+    client.connected.store(false, Ordering::SeqCst);
+    client.shutdown.cancel();
+    close_local_state(client);
+}
+
+fn close_local_state(client: &ClientInner) {
+    client
+        .full_listeners
+        .lock()
+        .expect("full_listeners lock poisoned")
+        .clear();
+
+    let bindings = client
+        .bindings_by_suffix
+        .lock()
+        .expect("bindings_by_suffix lock poisoned")
+        .drain()
+        .flat_map(|(_, entries)| entries)
+        .collect::<Vec<_>>();
+
+    let mut seen = HashSet::<usize>::new();
+    for binding in bindings {
+        if !seen.insert(binding.id) {
+            continue;
+        }
+        if let Some(mailbox) = binding.mailbox.upgrade() {
+            mailbox.closed.store(true, Ordering::SeqCst);
+            mailbox
+                .listener_sender
+                .lock()
+                .expect("mailbox listener_sender lock poisoned")
+                .take();
+        }
+    }
 }
 
 fn dispatch_envelope(client: &ClientInner, envelope: ParsedEnvelope) {
@@ -858,33 +1062,12 @@ fn broadcast_to_full_listeners(client: &ClientInner, item: ListenerItem) {
         .cloned()
         .collect::<Vec<_>>();
     for sender in listeners {
-        let _ = sender.send(item.clone());
-    }
-}
-
-fn broadcast_control(client: &ClientInner, item: ListenerItem) {
-    let full_listeners = client
-        .full_listeners
-        .lock()
-        .expect("full_listeners lock poisoned")
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let all_bindings = client
-        .bindings_by_suffix
-        .lock()
-        .expect("bindings_by_suffix lock poisoned")
-        .values()
-        .flat_map(|entries| entries.iter().cloned())
-        .collect::<Vec<_>>();
-
-    for sender in full_listeners {
-        let _ = sender.send(item.clone());
-    }
-    for binding in all_bindings {
-        if let Some(mailbox) = binding.mailbox.upgrade() {
-            enqueue_mailbox_message(&mailbox, item.clone());
+        match sender.try_send(item.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                client.full_dropped.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 }
@@ -896,7 +1079,13 @@ fn enqueue_mailbox_message(mailbox: &MailboxInner, item: ListenerItem) {
         .expect("mailbox listener_sender lock poisoned")
         .clone();
     if let Some(sender) = sender {
-        let _ = sender.send(item);
+        match sender.try_send(item) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                mailbox.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
     }
 }
 
@@ -1172,6 +1361,11 @@ fn collect_message_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::Arc;
 
     #[test]
     fn suffix_parses() {
@@ -1192,5 +1386,234 @@ mod tests {
             .to_string();
         assert!(err.contains("non-local base_url must use https"));
         assert!(normalize_base_url("http://localhost:8787").is_ok());
+    }
+
+    #[test]
+    fn close_interrupts_idle_stream_promptly() {
+        let server = TestServer::spawn(vec![ConnectionScript::ReadyThenIdle]);
+        let client = Client::new("token", Some(&server.base_url())).unwrap();
+
+        let started = Instant::now();
+        client.close().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "close() should not block on an idle upstream stream"
+        );
+    }
+
+    #[test]
+    fn invalid_json_after_connect_becomes_fatal() {
+        let server = TestServer::spawn(vec![ConnectionScript::ReadyThenInvalidJson]);
+        let client = Client::new("token", Some(&server.base_url())).unwrap();
+
+        wait_until(Duration::from_secs(2), || client.error().is_some());
+        let error = client.error().expect("fatal error should be recorded");
+        assert!(
+            error.to_string().contains("invalid JSON"),
+            "unexpected fatal error: {error}"
+        );
+        assert!(client.listen(None).is_err());
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_queues_report_drops() {
+        let server = TestServer::spawn(vec![
+            ConnectionScript::BurstMail { count: 512 },
+            ConnectionScript::ReadyThenIdle,
+        ]);
+        let client = Client::new("token", Some(&server.base_url())).unwrap();
+        let _all_listener = client.listen(None).unwrap();
+        let mailbox = client
+            .bind_prefix("alice", Suffix::linuxdo_space(), false)
+            .unwrap();
+        let _mailbox_listener = mailbox.listen(None).unwrap();
+
+        wait_until(Duration::from_secs(2), || {
+            client.dropped() > 0 || mailbox.dropped() > 0
+        });
+
+        assert!(client.dropped() > 0);
+        assert!(mailbox.dropped() > 0);
+        client.close().unwrap();
+    }
+
+    fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out while waiting for condition");
+    }
+
+    enum ConnectionScript {
+        ReadyThenIdle,
+        ReadyThenInvalidJson,
+        BurstMail { count: usize },
+    }
+
+    struct TestServer {
+        base_url: String,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn spawn(scripts: Vec<ConnectionScript>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let scripts = Arc::new(Mutex::new(VecDeque::from(scripts)));
+            let thread_shutdown = Arc::clone(&shutdown);
+            let thread_scripts = Arc::clone(&scripts);
+
+            let handle = thread::spawn(move || {
+                while !thread_shutdown.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let script = thread_scripts
+                                .lock()
+                                .expect("scripts lock poisoned")
+                                .pop_front()
+                                .unwrap_or(ConnectionScript::ReadyThenIdle);
+                            let shutdown = Arc::clone(&thread_shutdown);
+                            handle_connection(&mut stream, script, &shutdown);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+
+            Self {
+                base_url: format!("http://{}", address),
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            self.base_url.clone()
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(
+                self.base_url.trim_start_matches("http://"),
+            );
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn handle_connection(
+        stream: &mut std::net::TcpStream,
+        script: ConnectionScript,
+        shutdown: &AtomicBool,
+    ) {
+        let _ = read_http_request(stream);
+        match script {
+            ConnectionScript::ReadyThenIdle => {
+                write_stream_headers(stream);
+                write_chunk(stream, ready_line().as_bytes());
+                let _ = stream.flush();
+                while !shutdown.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+            ConnectionScript::ReadyThenInvalidJson => {
+                write_stream_headers(stream);
+                write_chunk(stream, ready_line().as_bytes());
+                write_chunk(stream, b"{not-json}\n");
+                write_stream_end(stream);
+            }
+            ConnectionScript::BurstMail { count } => {
+                write_stream_headers(stream);
+                write_chunk(stream, ready_line().as_bytes());
+                for index in 0..count {
+                    let event = mail_line(
+                        &format!("alice@linuxdo.space"),
+                        &format!("Subject {index}"),
+                    );
+                    write_chunk(stream, event.as_bytes());
+                }
+                write_stream_end(stream);
+            }
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut buffer = [0_u8; 4096];
+        let mut received = Vec::new();
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(read) => {
+                    received.extend_from_slice(&buffer[..read]);
+                    if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                        return Ok(());
+                    }
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn write_stream_headers(stream: &mut std::net::TcpStream) {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        );
+    }
+
+    fn write_chunk(stream: &mut std::net::TcpStream, payload: &[u8]) {
+        let _ = stream.write_all(format!("{:X}\r\n", payload.len()).as_bytes());
+        let _ = stream.write_all(payload);
+        let _ = stream.write_all(b"\r\n");
+    }
+
+    fn write_stream_end(stream: &mut std::net::TcpStream) {
+        let _ = stream.write_all(b"0\r\n\r\n");
+        let _ = stream.flush();
+    }
+
+    fn ready_line() -> String {
+        serde_json::json!({
+            "type": "ready",
+            "token_public_id": "tok_123"
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn mail_line(recipient: &str, subject: &str) -> String {
+        let raw = format!(
+            "From: sender@example.com\r\nTo: {recipient}\r\nSubject: {subject}\r\n\r\nHello"
+        );
+        serde_json::json!({
+            "type": "mail",
+            "original_envelope_from": "sender@example.com",
+            "original_recipients": [recipient],
+            "received_at": "2026-03-20T10:11:12Z",
+            "raw_message_base64": BASE64_STANDARD.encode(raw.as_bytes()),
+        })
+        .to_string()
+            + "\n"
     }
 }

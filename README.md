@@ -9,11 +9,16 @@ The SDK follows the shared contract in:
 Core runtime behavior:
 
 - one `Client` owns one upstream stream to `/v1/token/email/stream`
+- the upstream stream runs inside a dedicated background thread with a Tokio runtime
 - full stream intake is available through `client.listen(...)`
 - exact and regex mailbox bindings share one ordered chain per suffix
 - `allow_overlap = false` stops matching at first hit
 - `allow_overlap = true` continues matching to later bindings
 - mailbox queues activate only while mailbox `listen(...)` is active
+- stream open timeout and post-connect idle timeout are handled separately
+- `client.close()` actively cancels the live stream instead of waiting for the socket to wake up
+- protocol-decode failures after connect are treated as fatal, not endlessly retried
+- listener queues are bounded; dropped full-stream messages can be inspected through `client.dropped()`
 
 ## Install (local workspace)
 
@@ -55,6 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `Mailbox`
 - `ClientListener`
 - `MailboxListener`
+
+Useful observability helpers:
+
+- `Client::error() -> Option<LinuxDoSpaceError>`
+- `Client::dropped() -> u64`
+- `Mailbox::dropped() -> u64`
 
 ## Validation commands
 
