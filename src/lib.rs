@@ -18,8 +18,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
-use reqwest::{Client as HttpClient, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, USER_AGENT};
+use reqwest::{Client as HttpClient, Response};
 use serde::Deserialize;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::time::{sleep, timeout};
@@ -959,10 +959,7 @@ async fn open_stream(client: &ClientInner) -> Result<Response, StreamLoopError> 
     Ok(response)
 }
 
-fn handle_stream_line(
-    client: &ClientInner,
-    line: &[u8],
-) -> Result<bool, StreamLoopError> {
+fn handle_stream_line(client: &ClientInner, line: &[u8]) -> Result<bool, StreamLoopError> {
     let trimmed = std::str::from_utf8(line)
         .map_err(|err| {
             StreamLoopError::Fatal(LinuxDoSpaceError::stream(format!(
@@ -1001,8 +998,7 @@ fn handle_stream_line(
         }
         "heartbeat" => Ok(false),
         "mail" => {
-            let envelope = parse_mail_event(&event)
-                .map_err(StreamLoopError::Fatal)?;
+            let envelope = parse_mail_event(&event).map_err(StreamLoopError::Fatal)?;
             dispatch_envelope(client, envelope);
             Ok(false)
         }
@@ -1559,9 +1555,7 @@ mod tests {
     impl Drop for TestServer {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::SeqCst);
-            let _ = std::net::TcpStream::connect(
-                self.base_url.trim_start_matches("http://"),
-            );
+            let _ = std::net::TcpStream::connect(self.base_url.trim_start_matches("http://"));
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
