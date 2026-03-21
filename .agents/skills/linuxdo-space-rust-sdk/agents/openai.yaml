@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinuxDoSpace Rust SDK"
+  short_description: "Use or maintain the LinuxDoSpace Rust SDK"
+  default_prompt: "Use $linuxdo-space-rust-sdk when writing consumer code against sdk/rust or when updating the LinuxDoSpace Rust SDK with matching docs and validation guidance."
