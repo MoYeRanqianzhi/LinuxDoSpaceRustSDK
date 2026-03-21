@@ -40,4 +40,3 @@
 - Exact and regex bindings share one ordered chain per suffix.
 - Iterator timeouts end iteration with `None`.
 - `allow_overlap=false` stops at the first match.
-

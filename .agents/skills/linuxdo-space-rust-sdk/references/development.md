@@ -29,4 +29,3 @@ cargo package --locked
 - `../../../README.md`
 - `../../../.github/workflows/ci.yml`
 - `../../../.github/workflows/release.yml`
-

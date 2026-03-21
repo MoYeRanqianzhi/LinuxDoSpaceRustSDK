@@ -17,4 +17,3 @@ let catch_all = client.bind_pattern(".*", Suffix::linuxdo_space(), true)?;
 ```rust
 let targets = client.route(&message);
 ```
-

@@ -38,4 +38,3 @@ let mut listener = mailbox.listen(Some(std::time::Duration::from_secs(30)))?;
 - `route(&MailMessage)` is local matching only.
 - Full-stream messages use a primary projection address.
 - Mailbox messages use matched-recipient projection addresses.
-

@@ -32,4 +32,3 @@ Read [references/development.md](references/development.md) only when editing `s
 - Do not document `cargo install`; this crate is a library.
 - Do not document crates.io publication; current release output is GitHub Release `.crate` assets.
 - Do not add hidden pre-listen mailbox buffering.
-
