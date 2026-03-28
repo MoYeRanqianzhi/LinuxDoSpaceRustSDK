@@ -1773,10 +1773,12 @@ mod tests {
             dynamic_mailbox.address().as_deref(),
             Some("ops@testuser-mailfoo-bar.linuxdo.space")
         );
-        wait_until(Duration::from_secs(5), || {
-            server.filter_requests().len() >= 2
-        });
         let filter_requests = server.filter_requests();
+        assert!(
+            filter_requests.len() >= 2,
+            "expected at least two filter sync requests, got {:?}",
+            filter_requests
+        );
         assert_eq!(filter_requests[0], vec![String::new()]);
         assert_eq!(
             filter_requests[1],
@@ -1784,10 +1786,12 @@ mod tests {
         );
 
         default_mailbox.close().unwrap();
-        wait_until(Duration::from_secs(5), || {
-            server.filter_requests().len() >= 3
-        });
         let filter_requests = server.filter_requests();
+        assert!(
+            filter_requests.len() >= 3,
+            "expected at least three filter sync requests, got {:?}",
+            filter_requests
+        );
         assert_eq!(filter_requests[2], vec!["foo-bar".to_string()]);
         client.close().unwrap();
     }
