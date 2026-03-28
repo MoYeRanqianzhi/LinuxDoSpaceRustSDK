@@ -131,9 +131,7 @@ fn normalize_mail_suffix_fragment(raw: &str) -> Result<String, LinuxDoSpaceError
 impl Display for Suffix {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LinuxdoSpace | Self::LinuxdoSpaceWithFragment(_) => {
-                f.write_str("linuxdo.space")
-            }
+            Self::LinuxdoSpace | Self::LinuxdoSpaceWithFragment(_) => f.write_str("linuxdo.space"),
             Self::Custom(value) => f.write_str(value),
         }
     }
@@ -1775,7 +1773,9 @@ mod tests {
             dynamic_mailbox.address().as_deref(),
             Some("ops@testuser-mailfoo-bar.linuxdo.space")
         );
-        wait_until(Duration::from_secs(5), || server.filter_requests().len() >= 2);
+        wait_until(Duration::from_secs(5), || {
+            server.filter_requests().len() >= 2
+        });
         let filter_requests = server.filter_requests();
         assert_eq!(filter_requests[0], vec![String::new()]);
         assert_eq!(
@@ -1784,7 +1784,9 @@ mod tests {
         );
 
         default_mailbox.close().unwrap();
-        wait_until(Duration::from_secs(5), || server.filter_requests().len() >= 3);
+        wait_until(Duration::from_secs(5), || {
+            server.filter_requests().len() >= 3
+        });
         let filter_requests = server.filter_requests();
         assert_eq!(filter_requests[2], vec!["foo-bar".to_string()]);
         client.close().unwrap();
@@ -1836,11 +1838,7 @@ mod tests {
                             thread::spawn(move || {
                                 let request = read_http_request(&mut stream).unwrap_or_default();
                                 if request.starts_with("PUT /v1/token/email/filters ") {
-                                    handle_filter_request(
-                                        &mut stream,
-                                        &request,
-                                        &filter_requests,
-                                    );
+                                    handle_filter_request(&mut stream, &request, &filter_requests);
                                     return;
                                 }
                                 let script = scripts
