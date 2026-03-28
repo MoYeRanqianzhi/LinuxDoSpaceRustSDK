@@ -1,6 +1,6 @@
 [package]
 name = "linuxdospace-rust"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "MIT"
 description = "LinuxDoSpace Rust SDK for HTTPS mail streaming"
