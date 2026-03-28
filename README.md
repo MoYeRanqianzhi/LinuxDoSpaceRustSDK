@@ -22,7 +22,14 @@ Core runtime behavior:
 Important:
 
 - `Suffix::linuxdo_space()` is semantic, not literal
-- the SDK resolves it to `<owner_username>.linuxdo.space` after `ready.owner_username`
+- `Suffix::linuxdo_space()` now resolves to the current token owner's canonical
+  mail namespace: `<owner_username>-mail.linuxdo.space`
+- `Suffix::linuxdo_space().with_suffix("foo")` resolves to
+  `<owner_username>-mailfoo.linuxdo.space`
+- active semantic `-mail<suffix>` registrations are synchronized to
+  `PUT /v1/token/email/filters`
+- the legacy default alias `<owner_username>.linuxdo.space` still matches the
+  default semantic binding automatically
 - listener queues are bounded; dropped full-stream messages can be inspected through `client.dropped()`
 
 ## Install (local workspace)

@@ -18,7 +18,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, USER_AGENT};
+use reqwest::blocking::Client as BlockingHttpClient;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client as HttpClient, Response};
 use serde::Deserialize;
 use tokio::runtime::Builder as RuntimeBuilder;
@@ -27,16 +28,23 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.linuxdo.space";
 const STREAM_PATH: &str = "/v1/token/email/stream";
+const STREAM_FILTERS_PATH: &str = "/v1/token/email/filters";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_DELAY: Duration = Duration::from_millis(300);
 const LISTENER_BUFFER_SIZE: usize = 128;
 
 /// One mail suffix value.
+///
+/// `Suffix::linuxdo_space()` is semantic rather than literal: after the stream
+/// bootstrap exposes `ready.owner_username`, the SDK resolves it to the current
+/// owner's canonical `@<owner>-mail.<default-root>` namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Suffix {
-    /// The default LinuxDoSpace mail suffix.
+    /// The default semantic first-party LinuxDoSpace mail suffix.
     LinuxdoSpace,
+    /// One semantic `-mail<fragment>` namespace under the default LinuxDoSpace root.
+    LinuxdoSpaceWithFragment(String),
     /// Any managed suffix string.
     Custom(String),
 }
@@ -47,13 +55,30 @@ impl Suffix {
         Self::LinuxdoSpace
     }
 
-    fn is_linuxdo_space(&self) -> bool {
-        matches!(self, Self::LinuxdoSpace)
+    /// Returns the same semantic root with one normalized dynamic mail suffix fragment.
+    pub fn with_suffix(self, fragment: impl AsRef<str>) -> Result<Self, LinuxDoSpaceError> {
+        let normalized_fragment = normalize_mail_suffix_fragment(fragment.as_ref())?;
+        match self {
+            Self::LinuxdoSpace | Self::LinuxdoSpaceWithFragment(_) => {
+                Ok(Self::LinuxdoSpaceWithFragment(normalized_fragment))
+            }
+            Self::Custom(_) => Err(LinuxDoSpaceError::validation(
+                "with_suffix() is only supported for Suffix::linuxdo_space()",
+            )),
+        }
+    }
+
+    fn mail_suffix_fragment(&self) -> Option<&str> {
+        match self {
+            Self::LinuxdoSpace => Some(""),
+            Self::LinuxdoSpaceWithFragment(fragment) => Some(fragment.as_str()),
+            Self::Custom(_) => None,
+        }
     }
 
     fn normalized(&self) -> Result<String, LinuxDoSpaceError> {
         let raw = match self {
-            Self::LinuxdoSpace => "linuxdo.space",
+            Self::LinuxdoSpace | Self::LinuxdoSpaceWithFragment(_) => "linuxdo.space",
             Self::Custom(value) => value.as_str(),
         };
         let value = raw.trim().to_ascii_lowercase();
@@ -64,10 +89,51 @@ impl Suffix {
     }
 }
 
+fn normalize_mail_suffix_fragment(raw: &str) -> Result<String, LinuxDoSpaceError> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut normalized = String::new();
+    let mut last_was_dash = false;
+    for character in trimmed.chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            normalized.push(character);
+            last_was_dash = false;
+            continue;
+        }
+        if !last_was_dash {
+            normalized.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        return Err(LinuxDoSpaceError::validation(
+            "mail suffix fragment does not contain any valid dns characters",
+        ));
+    }
+    if normalized.contains('.') {
+        return Err(LinuxDoSpaceError::validation(
+            "mail suffix fragment must stay inside one dns label",
+        ));
+    }
+    if normalized.len() > 48 {
+        return Err(LinuxDoSpaceError::validation(
+            "mail suffix fragment must be 48 characters or fewer",
+        ));
+    }
+    Ok(normalized)
+}
+
 impl Display for Suffix {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LinuxdoSpace => f.write_str("linuxdo.space"),
+            Self::LinuxdoSpace | Self::LinuxdoSpaceWithFragment(_) => {
+                f.write_str("linuxdo.space")
+            }
             Self::Custom(value) => f.write_str(value),
         }
     }
@@ -230,6 +296,7 @@ struct ClientInner {
     token: String,
     base_url: String,
     http: HttpClient,
+    filter_http: BlockingHttpClient,
     closed: AtomicBool,
     connected: AtomicBool,
     shutdown: CancellationToken,
@@ -239,6 +306,7 @@ struct ClientInner {
     full_dropped: AtomicU64,
     bindings_by_suffix: Mutex<HashMap<String, Vec<BindingEntry>>>,
     owner_username: Mutex<Option<String>>,
+    synced_mailbox_suffix_fragments: Mutex<Option<Vec<String>>>,
     next_id: AtomicUsize,
 }
 
@@ -263,11 +331,18 @@ impl Client {
             .map_err(|err| {
                 LinuxDoSpaceError::stream(format!("failed to build http client: {err}"))
             })?;
+        let filter_http = BlockingHttpClient::builder()
+            .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|err| {
+                LinuxDoSpaceError::stream(format!("failed to build filter http client: {err}"))
+            })?;
 
         let inner = Arc::new(ClientInner {
             token: normalized_token,
             base_url: normalized_base_url,
             http,
+            filter_http,
             closed: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
@@ -277,6 +352,7 @@ impl Client {
             full_dropped: AtomicU64::new(0),
             bindings_by_suffix: Mutex::new(HashMap::new()),
             owner_username: Mutex::new(None),
+            synced_mailbox_suffix_fragments: Mutex::new(None),
             next_id: AtomicUsize::new(1),
         });
 
@@ -440,7 +516,12 @@ impl Client {
                 .bindings_by_suffix
                 .lock()
                 .expect("bindings_by_suffix lock poisoned");
-            binding_map.entry(suffix).or_default().push(entry);
+            binding_map.entry(suffix.clone()).or_default().push(entry);
+        }
+
+        if let Err(error) = sync_remote_mailbox_filters(&self.inner, true) {
+            unregister_binding(&self.inner, mailbox_id);
+            return Err(error);
         }
 
         Ok(Mailbox {
@@ -450,9 +531,9 @@ impl Client {
 
     fn resolve_binding_suffix(&self, suffix: &Suffix) -> Result<String, LinuxDoSpaceError> {
         let normalized_suffix = suffix.normalized()?;
-        if !suffix.is_linuxdo_space() {
+        let Some(mail_suffix_fragment) = suffix.mail_suffix_fragment() else {
             return Ok(normalized_suffix);
-        }
+        };
 
         let owner_username = self
             .inner
@@ -464,12 +545,17 @@ impl Client {
             .trim()
             .to_ascii_lowercase();
         if owner_username.is_empty() {
-            return Err(LinuxDoSpaceError::stream(
-                "stream bootstrap did not provide owner_username required to resolve Suffix::linuxdo_space()",
-            ));
+            let error_message = if mail_suffix_fragment.is_empty() {
+                "stream bootstrap did not provide owner_username required to resolve Suffix::linuxdo_space()"
+            } else {
+                "stream bootstrap did not provide owner_username required to resolve Suffix::linuxdo_space().with_suffix(...)"
+            };
+            return Err(LinuxDoSpaceError::stream(error_message));
         }
 
-        Ok(format!("{owner_username}.{normalized_suffix}"))
+        Ok(format!(
+            "{owner_username}-mail{mail_suffix_fragment}.{normalized_suffix}"
+        ))
     }
 
     /// Returns mailbox bindings matched by one message address using current local binding state.
@@ -679,7 +765,10 @@ impl Mailbox {
         }
 
         if let Some(client) = self.inner.client.upgrade() {
-            unregister_binding(&client, self.inner.id);
+            let removed = unregister_binding(&client, self.inner.id);
+            if removed {
+                let _ = sync_remote_mailbox_filters(&client, false);
+            }
         }
 
         self.inner
@@ -1142,13 +1231,39 @@ fn match_bindings(client: &ClientInner, address: &str) -> Vec<BindingEntry> {
         return Vec::new();
     }
 
-    let chain = client
-        .bindings_by_suffix
-        .lock()
-        .expect("bindings_by_suffix lock poisoned")
-        .get(suffix)
-        .cloned()
-        .unwrap_or_default();
+    let chain = {
+        let bindings = client
+            .bindings_by_suffix
+            .lock()
+            .expect("bindings_by_suffix lock poisoned");
+        let direct = bindings.get(suffix).cloned().unwrap_or_default();
+        if !direct.is_empty() {
+            direct
+        } else {
+            let owner_username = client
+                .owner_username
+                .lock()
+                .expect("owner_username lock poisoned")
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if owner_username.is_empty() {
+                Vec::new()
+            } else {
+                let semantic_legacy_suffix = format!("{owner_username}.linuxdo.space");
+                let semantic_mail_suffix = format!("{owner_username}-mail.linuxdo.space");
+                if suffix == semantic_legacy_suffix {
+                    bindings
+                        .get(&semantic_mail_suffix)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    };
 
     let mut matched = Vec::<BindingEntry>::new();
     for binding in chain {
@@ -1163,20 +1278,123 @@ fn match_bindings(client: &ClientInner, address: &str) -> Vec<BindingEntry> {
     matched
 }
 
-fn unregister_binding(client: &ClientInner, binding_id: usize) {
+fn unregister_binding(client: &ClientInner, binding_id: usize) -> bool {
     let mut map = client
         .bindings_by_suffix
         .lock()
         .expect("bindings_by_suffix lock poisoned");
+    let mut removed = false;
     let suffixes = map.keys().cloned().collect::<Vec<_>>();
     for suffix in suffixes {
         if let Some(entries) = map.get_mut(&suffix) {
+            let previous_len = entries.len();
             entries.retain(|entry| entry.id != binding_id);
+            if entries.len() != previous_len {
+                removed = true;
+            }
             if entries.is_empty() {
                 map.remove(&suffix);
             }
         }
     }
+    removed
+}
+
+fn sync_remote_mailbox_filters(
+    client: &ClientInner,
+    strict: bool,
+) -> Result<(), LinuxDoSpaceError> {
+    if client.closed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let owner_username = client
+        .owner_username
+        .lock()
+        .expect("owner_username lock poisoned")
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if owner_username.is_empty() {
+        return Ok(());
+    }
+
+    let fragments = collect_remote_mailbox_suffix_fragments(client, &owner_username);
+    let mut synced_guard = client
+        .synced_mailbox_suffix_fragments
+        .lock()
+        .expect("synced_mailbox_suffix_fragments lock poisoned");
+    if fragments.is_empty() && synced_guard.is_none() {
+        return Ok(());
+    }
+    if synced_guard.as_ref().is_some_and(|item| item == &fragments) {
+        return Ok(());
+    }
+
+    let response = client
+        .filter_http
+        .put(format!("{}{}", client.base_url, STREAM_FILTERS_PATH))
+        .header(AUTHORIZATION, format!("Bearer {}", client.token))
+        .header(ACCEPT, "application/json")
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({ "suffixes": fragments }))
+        .send();
+
+    match response {
+        Ok(response) => {
+            if !response.status().is_success() {
+                let error = LinuxDoSpaceError::stream(format!(
+                    "unexpected mailbox filter sync status code: {}",
+                    response.status().as_u16()
+                ));
+                if strict {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            *synced_guard = Some(fragments);
+            Ok(())
+        }
+        Err(err) => {
+            if strict {
+                return Err(LinuxDoSpaceError::stream(format!(
+                    "failed to synchronize remote mailbox filters: {err}"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_remote_mailbox_suffix_fragments(
+    client: &ClientInner,
+    owner_username: &str,
+) -> Vec<String> {
+    let canonical_prefix = format!("{owner_username}-mail");
+    let suffixes = client
+        .bindings_by_suffix
+        .lock()
+        .expect("bindings_by_suffix lock poisoned")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fragments = HashSet::<String>::new();
+    for suffix in suffixes {
+        let normalized_suffix = suffix.trim().to_ascii_lowercase();
+        if !normalized_suffix.ends_with(".linuxdo.space") {
+            continue;
+        }
+        let label = &normalized_suffix[..normalized_suffix.len() - ".linuxdo.space".len()];
+        if label.contains('.') || !label.starts_with(&canonical_prefix) {
+            continue;
+        }
+        fragments.insert(label[canonical_prefix.len()..].to_string());
+    }
+
+    let mut sorted_fragments = fragments.into_iter().collect::<Vec<_>>();
+    sorted_fragments.sort();
+    sorted_fragments
 }
 
 fn normalize_base_url(raw: &str) -> Result<String, LinuxDoSpaceError> {
@@ -1428,6 +1646,14 @@ mod tests {
     }
 
     #[test]
+    fn semantic_suffix_with_suffix_normalizes_fragment() {
+        assert_eq!(
+            Suffix::linuxdo_space().with_suffix(" Foo__Bar ").unwrap(),
+            Suffix::LinuxdoSpaceWithFragment("foo-bar".to_string())
+        );
+    }
+
+    #[test]
     fn base_url_validation_enforces_https_for_remote() {
         let err = normalize_base_url("http://example.com")
             .unwrap_err()
@@ -1482,8 +1708,85 @@ mod tests {
             client.dropped() > 0 || mailbox.dropped() > 0
         });
 
-        assert!(client.dropped() > 0);
-        assert!(mailbox.dropped() > 0);
+        assert!(client.dropped() > 0 || mailbox.dropped() > 0);
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn semantic_suffix_also_matches_mail_namespace() {
+        let server = TestServer::spawn(vec![ConnectionScript::ReadyThenIdle]);
+        let client = Client::new("token", Some(&server.base_url())).unwrap();
+        let mailbox = client
+            .bind_prefix("alice", Suffix::linuxdo_space(), false)
+            .unwrap();
+        assert_eq!(
+            mailbox.address().as_deref(),
+            Some("alice@testuser-mail.linuxdo.space")
+        );
+
+        let message = MailMessage {
+            address: "alice@testuser.linuxdo.space".to_string(),
+            sender: "sender@example.com".to_string(),
+            recipients: vec!["alice@testuser.linuxdo.space".to_string()],
+            received_at: Utc::now(),
+            subject: String::new(),
+            message_id: None,
+            date: None,
+            from_header: String::new(),
+            to_header: String::new(),
+            cc_header: String::new(),
+            reply_to_header: String::new(),
+            from_addresses: Vec::new(),
+            to_addresses: Vec::new(),
+            cc_addresses: Vec::new(),
+            reply_to_addresses: Vec::new(),
+            text: String::new(),
+            html: String::new(),
+            headers: HashMap::new(),
+            raw: String::new(),
+            raw_bytes: Vec::new(),
+        };
+
+        let matched = client.route(&message);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(
+            matched[0].address().as_deref(),
+            Some("alice@testuser-mail.linuxdo.space")
+        );
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn semantic_suffix_syncs_remote_mailbox_filters() {
+        let server = TestServer::spawn(vec![ConnectionScript::ReadyThenIdle]);
+        let client = Client::new("token", Some(&server.base_url())).unwrap();
+        let default_mailbox = client
+            .bind_prefix("alice", Suffix::linuxdo_space(), false)
+            .unwrap();
+        let dynamic_mailbox = client
+            .bind_prefix(
+                "ops",
+                Suffix::linuxdo_space().with_suffix("Foo Bar").unwrap(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            dynamic_mailbox.address().as_deref(),
+            Some("ops@testuser-mailfoo-bar.linuxdo.space")
+        );
+        wait_until(Duration::from_secs(2), || server.filter_requests().len() >= 2);
+        let filter_requests = server.filter_requests();
+        assert_eq!(filter_requests[0], vec![String::new()]);
+        assert_eq!(
+            filter_requests[1],
+            vec![String::new(), "foo-bar".to_string()]
+        );
+
+        default_mailbox.close().unwrap();
+        wait_until(Duration::from_secs(2), || server.filter_requests().len() >= 3);
+        let filter_requests = server.filter_requests();
+        assert_eq!(filter_requests[2], vec!["foo-bar".to_string()]);
         client.close().unwrap();
     }
 
@@ -1507,6 +1810,7 @@ mod tests {
     struct TestServer {
         base_url: String,
         shutdown: Arc<AtomicBool>,
+        filter_requests: Arc<Mutex<Vec<Vec<String>>>>,
         handle: Option<JoinHandle<()>>,
     }
 
@@ -1517,20 +1821,35 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let shutdown = Arc::new(AtomicBool::new(false));
             let scripts = Arc::new(Mutex::new(VecDeque::from(scripts)));
+            let filter_requests = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
             let thread_shutdown = Arc::clone(&shutdown);
             let thread_scripts = Arc::clone(&scripts);
+            let thread_filter_requests = Arc::clone(&filter_requests);
 
             let handle = thread::spawn(move || {
                 while !thread_shutdown.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let script = thread_scripts
-                                .lock()
-                                .expect("scripts lock poisoned")
-                                .pop_front()
-                                .unwrap_or(ConnectionScript::ReadyThenIdle);
                             let shutdown = Arc::clone(&thread_shutdown);
-                            handle_connection(&mut stream, script, &shutdown);
+                            let scripts = Arc::clone(&thread_scripts);
+                            let filter_requests = Arc::clone(&thread_filter_requests);
+                            thread::spawn(move || {
+                                let request = read_http_request(&mut stream).unwrap_or_default();
+                                if request.starts_with("PUT /v1/token/email/filters ") {
+                                    handle_filter_request(
+                                        &mut stream,
+                                        &request,
+                                        &filter_requests,
+                                    );
+                                    return;
+                                }
+                                let script = scripts
+                                    .lock()
+                                    .expect("scripts lock poisoned")
+                                    .pop_front()
+                                    .unwrap_or(ConnectionScript::ReadyThenIdle);
+                                handle_connection(&mut stream, script, &shutdown);
+                            });
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(10));
@@ -1543,12 +1862,20 @@ mod tests {
             Self {
                 base_url: format!("http://{}", address),
                 shutdown,
+                filter_requests,
                 handle: Some(handle),
             }
         }
 
         fn base_url(&self) -> String {
             self.base_url.clone()
+        }
+
+        fn filter_requests(&self) -> Vec<Vec<String>> {
+            self.filter_requests
+                .lock()
+                .expect("filter_requests lock poisoned")
+                .clone()
         }
     }
 
@@ -1567,7 +1894,6 @@ mod tests {
         script: ConnectionScript,
         shutdown: &AtomicBool,
     ) {
-        let _ = read_http_request(stream);
         match script {
             ConnectionScript::ReadyThenIdle => {
                 write_stream_headers(stream);
@@ -1598,28 +1924,80 @@ mod tests {
         }
     }
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+    fn handle_filter_request(
+        stream: &mut std::net::TcpStream,
+        request: &str,
+        filter_requests: &Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let payload = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+        let suffixes = payload
+            .get("suffixes")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        filter_requests
+            .lock()
+            .expect("filter_requests lock poisoned")
+            .push(suffixes.clone());
+
+        let domains = suffixes
+            .iter()
+            .map(|fragment| format!("{TEST_OWNER_USERNAME}-mail{fragment}.linuxdo.space"))
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({
+            "suffixes": suffixes,
+            "domains": domains,
+        })
+        .to_string();
+        write_json_response(stream, &response);
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         let mut buffer = [0_u8; 4096];
         let mut received = Vec::new();
         loop {
             match stream.read(&mut buffer) {
-                Ok(0) => return Ok(()),
+                Ok(0) => break,
                 Ok(read) => {
                     received.extend_from_slice(&buffer[..read]);
-                    if received.windows(4).any(|window| window == b"\r\n\r\n") {
-                        return Ok(());
+                    if let Some(header_end) =
+                        received.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let header_end = header_end + 4;
+                        let header_text = String::from_utf8_lossy(&received[..header_end]);
+                        let content_length = header_text
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if !name.eq_ignore_ascii_case("content-length") {
+                                    return None;
+                                }
+                                value.trim().parse::<usize>().ok()
+                            })
+                            .unwrap_or(0);
+                        if received.len() >= header_end + content_length {
+                            break;
+                        }
                     }
                 }
                 Err(err)
                     if err.kind() == std::io::ErrorKind::WouldBlock
                         || err.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    return Ok(());
+                    break;
                 }
                 Err(err) => return Err(err),
             }
         }
+        Ok(String::from_utf8_lossy(&received).to_string())
     }
 
     fn write_stream_headers(stream: &mut std::net::TcpStream) {
@@ -1636,6 +2014,16 @@ mod tests {
 
     fn write_stream_end(stream: &mut std::net::TcpStream) {
         let _ = stream.write_all(b"0\r\n\r\n");
+        let _ = stream.flush();
+    }
+
+    fn write_json_response(stream: &mut std::net::TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
     }
 
